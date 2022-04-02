@@ -1,5 +1,6 @@
 use std::{
     sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Barrier},
     thread,
 };
 
@@ -30,13 +31,15 @@ impl<T> Chan<T> {
     fn recv<V>(&self, f: impl Fn(&T) -> Option<V>) -> Option<V> {
         loop {
             match f(&self.inner) {
-                Some(x) => break Some(x),
-                None => {
-                    while !self.unparked.swap(false, Ordering::Acquire) {
-                        thread::park();
-                    }
-                }
+                Some(x) => return Some(x),
+                None => self.park(),
             }
+        }
+    }
+
+    fn park(&self) {
+        while !self.unparked.swap(false, Ordering::Acquire) {
+            thread::park();
         }
     }
 
@@ -54,60 +57,21 @@ fn mpsc(c: &mut Criterion) {
     group.bench_function("protty-mpsc", |b| {
         b.iter(|| {
             let queue = Chan::new(jiffy::protty_mpsc::MpscQueue::default());
+            let barrier = Barrier::new(THREADS + 1);
 
             crossbeam::scope(|scope| {
                 for _ in 0..THREADS {
                     scope.spawn(|_| {
+                        barrier.wait();
                         for i in 0..MESSAGES / THREADS {
                             queue.send::<usize, _>(|c| Ok(c.push(i))).unwrap();
                         }
                     });
                 }
 
+                barrier.wait();
                 for _ in 0..MESSAGES {
                     queue.recv(|c| unsafe { c.pop() }).unwrap();
-                }
-            })
-            .unwrap();
-        })
-    });
-
-    // group.bench_function("jiffy", |b| {
-    //     b.iter(|| {
-    //         let queue = Chan::new(jiffy::Queue::new());
-
-    //         crossbeam::scope(|scope| {
-    //             for _ in 0..THREADS {
-    //                 scope.spawn(|_| {
-    //                     for i in 0..MESSAGES / THREADS {
-    //                         queue.send(|c| Ok::<_, ()>(c.push(i))).unwrap();
-    //                     }
-    //                 });
-    //             }
-
-    //             for _ in 0..MESSAGES {
-    //                 queue.recv(|c| unsafe { c.pop() }).unwrap();
-    //             }
-    //         })
-    //         .unwrap();
-    //     })
-    // });
-
-    group.bench_function("riffy", |b| {
-        b.iter(|| {
-            let queue = Chan::new(riffy::MpscQueue::new());
-
-            crossbeam::scope(|scope| {
-                for _ in 0..THREADS {
-                    scope.spawn(|_| {
-                        for i in 0..MESSAGES / THREADS {
-                            queue.send(|c| c.enqueue(i)).unwrap();
-                        }
-                    });
-                }
-
-                for _ in 0..MESSAGES {
-                    queue.recv(|c| c.dequeue()).unwrap();
                 }
             })
             .unwrap();
@@ -117,16 +81,19 @@ fn mpsc(c: &mut Criterion) {
     group.bench_function("crossbeam-queue", |b| {
         b.iter(|| {
             let queue = Chan::new(crossbeam::queue::SegQueue::new());
+            let barrier = Barrier::new(THREADS + 1);
 
             crossbeam::scope(|scope| {
                 for _ in 0..THREADS {
                     scope.spawn(|_| {
+                        barrier.wait();
                         for i in 0..MESSAGES / THREADS {
                             queue.send(|c| Ok::<_, ()>(c.push(i))).unwrap();
                         }
                     });
                 }
 
+                barrier.wait();
                 for _ in 0..MESSAGES {
                     queue.recv(|c| c.pop()).unwrap();
                 }
@@ -138,17 +105,22 @@ fn mpsc(c: &mut Criterion) {
     group.bench_function("std", |b| {
         b.iter(|| {
             let (tx, rx) = std::sync::mpsc::channel();
+            let barrier = Arc::new(Barrier::new(THREADS + 1));
 
             crossbeam::scope(|scope| {
                 for _ in 0..THREADS {
                     let tx = tx.clone();
+                    let barrier = barrier.clone();
+
                     scope.spawn(move |_| {
+                        barrier.wait();
                         for i in 0..MESSAGES / THREADS {
                             tx.send(i).unwrap();
                         }
                     });
                 }
 
+                barrier.wait();
                 for _ in 0..MESSAGES {
                     rx.recv().unwrap();
                 }
@@ -160,16 +132,19 @@ fn mpsc(c: &mut Criterion) {
     group.bench_function("flume", |b| {
         b.iter(|| {
             let (tx, rx) = flume::unbounded();
+            let barrier = Barrier::new(THREADS + 1);
 
             crossbeam::scope(|scope| {
                 for _ in 0..THREADS {
                     scope.spawn(|_| {
+                        barrier.wait();
                         for i in 0..MESSAGES / THREADS {
                             tx.send(i).unwrap();
                         }
                     });
                 }
 
+                barrier.wait();
                 for _ in 0..MESSAGES {
                     rx.recv().unwrap();
                 }
