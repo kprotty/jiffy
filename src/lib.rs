@@ -7,6 +7,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 pub mod protty_mpsc;
+pub mod sharded_lock_mpsc;
 
 const BLOCK: usize = 1620;
 

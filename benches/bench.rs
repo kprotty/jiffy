@@ -78,6 +78,30 @@ fn mpsc(c: &mut Criterion) {
         })
     });
 
+    group.bench_function("sharded-lock-mpsc", |b| {
+        b.iter(|| {
+            let queue = Chan::new(jiffy::sharded_lock_mpsc::MpscQueue::default());
+            let barrier = Barrier::new(THREADS + 1);
+
+            crossbeam::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|_| {
+                        barrier.wait();
+                        for i in 0..MESSAGES / THREADS {
+                            queue.send::<usize, _>(|c| Ok(c.push(i))).unwrap();
+                        }
+                    });
+                }
+
+                barrier.wait();
+                for _ in 0..MESSAGES {
+                    queue.recv(|c| unsafe { c.pop() }).unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
+
     group.bench_function("crossbeam-queue", |b| {
         b.iter(|| {
             let queue = Chan::new(crossbeam::queue::SegQueue::new());
