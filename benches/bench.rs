@@ -64,14 +64,8 @@ fn mpsc(c: &mut Criterion) {
                     });
                 }
 
-                for i in 0..MESSAGES {
-                    match queue.recv(|c| unsafe { c.pop() }) {
-                        Some(_) => {},
-                        None => unreachable!("failed to pop {:?}/{}", i, {
-                            let c = MESSAGES / THREADS;
-                            c * THREADS
-                        })
-                    }
+                for _ in 0..MESSAGES {
+                    queue.recv(|c| unsafe { c.pop() }).unwrap();
                 }
             })
             .unwrap();

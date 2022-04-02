@@ -1,328 +1,270 @@
 use crate::utils::CachePadded;
 use std::{
-    thread,
-    pin::Pin,
-    ptr::{self, NonNull},
-    marker::{PhantomPinned, PhantomData},
-    num::NonZeroUsize,
     cell::{Cell, UnsafeCell},
     hint::spin_loop,
+    marker::PhantomPinned,
     mem::{drop, MaybeUninit},
-    sync::atomic::{AtomicPtr, AtomicUsize, AtomicBool, Ordering},
+    pin::Pin,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    thread,
 };
 
-#[derive(Default)]
-struct SpinWait {
-    counter: u32,
+unsafe trait StrictProvenance: Sized {
+    fn addr(self) -> usize;
+    fn with_addr(self, addr: usize) -> Self;
+    fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self;
 }
 
-impl SpinWait {
+unsafe impl<T> StrictProvenance for *mut T {
+    fn addr(self) -> usize {
+        self as usize
+    }
+
+    fn with_addr(self, addr: usize) -> Self {
+        addr as Self
+    }
+
+    fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self {
+        self.with_addr(f(self.addr()))
+    }
+}
+
+fn pinned<P: Default, T, F: FnOnce(Pin<&P>) -> T>(f: F) -> T {
+    let pinnable = P::default();
+    f(unsafe { Pin::new_unchecked(&pinnable) })
+}
+
+#[derive(Default)]
+struct Backoff {
+    counter: usize,
+}
+
+impl Backoff {
     fn try_yield_now(&mut self) -> bool {
-        if !Self::should_spin() {
-            return false;
+        self.counter < 32 && {
+            self.counter += 1;
+            spin_loop();
+            true
         }
-
-        if self.counter >= 100 {
-            return false;
-        }
-
-        self.counter += 1;
-        spin_loop();
-        true
     }
 
     fn yield_now(&mut self) {
-        if !Self::should_spin() {
-            return;
+        self.counter = self.counter.wrapping_add(1);
+        if self.counter <= 3 {
+            (0..(1 << self.counter)).for_each(|_| spin_loop());
+        } else if cfg!(windows) {
+            (0..(1 << self.counter.min(5))).for_each(|_| spin_loop());
+        } else {
+            thread::yield_now();
         }
-
-        self.counter = (self.counter + 1).min(5);
-        for _ in 0..(1 << self.counter) {
-            spin_loop();
-        }
-    }
-
-    fn should_spin() -> bool {
-        static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
-
-        let num_cpus = NonZeroUsize::new(NUM_CPUS.load(Ordering::Relaxed))
-            .unwrap_or_else(|| {
-                let num_cpus = thread::available_parallelism()
-                    .ok()
-                    .or(NonZeroUsize::new(1))
-                    .unwrap();
-
-                NUM_CPUS.store(num_cpus.get(), Ordering::Relaxed);
-                num_cpus
-            });
-
-        num_cpus.get() > 1
     }
 }
 
-#[derive(Default)]
-struct Event {
+struct Parker {
     thread: Cell<Option<thread::Thread>>,
-    is_set: AtomicBool,
+    is_unparked: AtomicBool,
     _pinned: PhantomPinned,
 }
 
-impl Event {
-    fn with<F>(f: impl FnOnce(Pin<&Self>) -> F) -> F {
-        let event = Self::default();
-        event.thread.set(Some(thread::current()));
-        f(unsafe { Pin::new_unchecked(&event) })
+impl Default for Parker {
+    fn default() -> Self {
+        Self {
+            thread: Cell::new(Some(thread::current())),
+            is_unparked: AtomicBool::new(false),
+            _pinned: PhantomPinned,
+        }
     }
+}
 
-    fn wait(&self) {
-        while !self.is_set.load(Ordering::Acquire) {
+impl Parker {
+    fn park(&self) {
+        while !self.is_unparked.load(Ordering::Acquire) {
             thread::park();
         }
     }
 
-    fn set(&self) {
-        let is_set_ptr = NonNull::from(&self.is_set).as_ptr();
-        let thread = self.thread.take();
-        drop(self);
-
-        unsafe { (*is_set_ptr).store(true, Ordering::Release) };
-        let thread = thread.expect("Event without a thread");
-        thread.unpark()
-    }
-}
-
-#[derive(Default)]
-struct Parker {
-    event: AtomicPtr<Event>,
-}
-
-impl Parker {
-    #[inline]
-    fn park(&self) {
-        let mut ev = self.event.load(Ordering::Acquire);
-        let notified = NonNull::dangling().as_ptr();
-
-        // let mut spin = SpinWait::default();
-        // while !ptr::eq(ev, notified) && spin.try_yield_now() {
-        //     ev = self.event.load(Ordering::Acquire);
-        // }
-
-        if !ptr::eq(ev, notified) {
-            ev = self.park_slow();
-        }
-
-        assert!(ptr::eq(ev, notified));
-        self.event.store(ptr::null_mut(), Ordering::Relaxed);
-    }
-
-    #[cold]
-    fn park_slow(&self) -> *mut Event {
-        Event::with(|event| {
-            let event_ptr = NonNull::from(&*event).as_ptr();
-            let notified = NonNull::dangling().as_ptr();
-            assert!(!ptr::eq(event_ptr, notified));
-
-            match self.event.compare_exchange(
-                ptr::null_mut(),
-                event_ptr,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Err(ev) => ev,
-                Ok(_) => {
-                    event.wait();
-                    self.event.load(Ordering::Acquire)
-                }
-            }
-        })
-    }
-
     unsafe fn unpark(&self) {
-        let event_ptr = NonNull::from(&self.event).as_ptr();
-        let notified = NonNull::dangling().as_ptr();
+        let is_unparked = NonNull::from(&self.is_unparked).as_ptr();
+        let thread = self.thread.take().unwrap();
         drop(self);
-        
-        let ev = (*event_ptr).swap(notified, Ordering::AcqRel);
-        assert!(!ptr::eq(ev, notified), "multiple threads unparked Parker");
 
-        if !ev.is_null() {
-            (*ev).set();
-        }
+        (*is_unparked).store(true, Ordering::Release);
+        thread.unpark();
     }
 }
 
 #[derive(Default)]
 struct Waiter {
     next: Cell<Option<NonNull<Self>>>,
-    parker: Parker,
+    parker: AtomicPtr<Parker>,
     _pinned: PhantomPinned,
+}
+
+impl Waiter {
+    fn park(&self) {
+        let mut p = self.parker.load(Ordering::Acquire);
+        let notified = NonNull::dangling().as_ptr();
+
+        if !ptr::eq(p, notified) {
+            p = pinned::<Parker, _, _>(|parker| {
+                let parker_ptr = NonNull::from(&*parker).as_ptr();
+                assert!(!ptr::eq(parker_ptr, notified));
+
+                if let Err(p) = self.parker.compare_exchange(
+                    ptr::null_mut(),
+                    parker_ptr,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    return p;
+                }
+
+                parker.park();
+                self.parker.load(Ordering::Acquire)
+            });
+        }
+
+        assert!(ptr::eq(p, notified));
+        self.parker.store(ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    unsafe fn unpark(&self) {
+        let parker = NonNull::from(&self.parker).as_ptr();
+        drop(self);
+
+        let notified = NonNull::dangling().as_ptr();
+        let parker = (*parker).swap(notified, Ordering::AcqRel);
+
+        assert!(!ptr::eq(parker, notified));
+        if !parker.is_null() {
+            (*parker).unpark();
+        }
+    }
 }
 
 #[derive(Default)]
 struct WaitList {
-    top: AtomicPtr<Waiter>,
+    stack: AtomicPtr<Waiter>,
 }
 
 impl WaitList {
-    fn wait_while(&self, mut should_wait: impl FnMut() -> bool) {
-        let waiter = Waiter::default();
-        let waiter = unsafe { Pin::new_unchecked(&waiter) };
+    const fn new() -> Self {
+        Self {
+            stack: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
 
-        let mut spin = SpinWait::default();
-        let mut top = self.top.load(Ordering::Relaxed);
+    #[inline]
+    fn should_park(&self) -> bool {
+        let stack = self.stack.load(Ordering::Relaxed);
+        !stack.is_null()
+    }
 
-        while should_wait() {
-            if top.is_null() && spin.try_yield_now() {
-                top = self.top.load(Ordering::Relaxed);
-                continue;
-            }
-
-            waiter.next.set(NonNull::new(top));
-            if let Err(e) = self.top.compare_exchange_weak(
-                top,
-                NonNull::from(&*waiter).as_ptr(),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                top = e;
-                continue;
-            }
+    #[cold]
+    fn park_while(&self, should_wait: impl FnOnce() -> bool) {
+        pinned::<Waiter, _, _>(|waiter| {
+            let _ = self
+                .stack
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |stack| {
+                    waiter.next.set(NonNull::new(stack));
+                    Some(NonNull::from(&*waiter).as_ptr())
+                });
 
             if !should_wait() {
-                self.wake_all();
+                self.unpark_all();
             }
 
-            waiter.parker.park();
-            top = self.top.load(Ordering::Relaxed);
-        }
+            waiter.park();
+        })
     }
 
-    fn wake_all(&self) {
-        let mut top = self.top.load(Ordering::Relaxed);
-        while !top.is_null() {
-            match self.top.compare_exchange_weak(
-                top,
-                ptr::null_mut(),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(e) => top = e,
-            }
-        }
+    #[cold]
+    fn unpark_all(&self) {
+        unsafe {
+            let mut stack = self.stack.swap(ptr::null_mut(), Ordering::AcqRel);
+            while !stack.is_null() {
+                let waiter = stack;
+                let next = (*waiter).next.get();
 
-        while !top.is_null() {
-            unsafe {
-                let parker = NonNull::from(&(*top).parker).as_ptr();
-                let next = (*top).next.get().map(|ptr| ptr.as_ptr());
-
-                (*parker).unpark();
-                top = next.unwrap_or(ptr::null_mut());
+                stack = next.map(|p| p.as_ptr()).unwrap_or(ptr::null_mut());
+                (*waiter).unpark();
             }
         }
     }
 }
 
-struct Value<T>(UnsafeCell<MaybeUninit<T>>);
+struct Slot<T> {
+    active: AtomicBool,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
 
-impl<T> Value<T> {
-    const INIT: Self = Self(UnsafeCell::new(MaybeUninit::uninit()));
+impl<T> Slot<T> {
+    const EMPTY: Self = Self {
+        active: AtomicBool::new(false),
+        value: UnsafeCell::new(MaybeUninit::uninit()),
+    };
 
     unsafe fn write(&self, value: T) {
-        self.0.get().write(MaybeUninit::new(value))
+        self.value.get().write(MaybeUninit::new(value));
+        assert!(!self.active.load(Ordering::Relaxed));
+        self.active.store(true, Ordering::Release);
     }
 
-    unsafe fn read(&self) -> T {
-        self.0.get().read().assume_init()
+    unsafe fn read(&self) -> Option<T> {
+        if self.active.load(Ordering::Acquire) {
+            Some(self.value.get().read().assume_init())
+        } else {
+            None
+        }
     }
 }
 
-const LAP: usize = 256;
-const BLOCK_CAP: usize = LAP - 1;
+const LAP: usize = 32;
+const CAPACITY: usize = LAP - 1;
 
+#[repr(align(32))]
 struct Block<T> {
-    values: [Value<T>; BLOCK_CAP],
-    stored: [AtomicBool; BLOCK_CAP],
+    slots: [Slot<T>; CAPACITY],
     next: AtomicPtr<Self>,
 }
 
 impl<T> Block<T> {
     const fn new() -> Self {
-        const UNSTORED: AtomicBool = AtomicBool::new(false);
         Self {
-            values: [Value::<T>::INIT; BLOCK_CAP],
-            stored: [UNSTORED; BLOCK_CAP],
+            slots: [Slot::<T>::EMPTY; CAPACITY],
             next: AtomicPtr::new(ptr::null_mut()),
         }
     }
 }
 
 #[derive(Default)]
-struct Producer<T> {
-    position: AtomicUsize,
-    block: AtomicPtr<Block<T>>,
-    waiters: WaitList,
-}
-
-#[derive(Default)]
-struct Consumer<T> {
-    block: AtomicPtr<Block<T>>,
-    index: Cell<usize>,
-}
-
-#[derive(Default)]
 pub struct MpscQueue<T> {
-    producer: CachePadded<Producer<T>>,
-    consumer: CachePadded<Consumer<T>>,
-    _marker: PhantomData<T>,
-}
-
-unsafe impl<T: Send> Send for MpscQueue<T> {}
-unsafe impl<T: Send> Sync for MpscQueue<T> {}
-
-impl<T> Drop for MpscQueue<T> {
-    fn drop(&mut self) {
-        unsafe {
-            while let Some(value) = self.pop() {
-                drop(value);
-            }
-
-            let block = self.consumer.block.load(Ordering::Relaxed);
-            if !block.is_null() {
-                drop(Box::from_raw(block));
-            }
-        }
-    }
+    head: CachePadded<AtomicPtr<Block<T>>>,
+    tail: CachePadded<AtomicPtr<Block<T>>>,
+    waiters: CachePadded<WaitList>,
 }
 
 impl<T> MpscQueue<T> {
-    pub fn push(&self, item: T) {
+    pub const fn new() -> Self {
+        Self {
+            head: CachePadded(AtomicPtr::new(ptr::null_mut())),
+            tail: CachePadded(AtomicPtr::new(ptr::null_mut())),
+            waiters: CachePadded(WaitList::new()),
+        }
+    }
+
+    pub fn push(&self, value: T) {
         let mut next_block = None;
-        let mut spin = SpinWait::default();
-        
+        let mut backoff = Backoff::default();
+
         loop {
-            let position = self.producer.position.load(Ordering::Acquire);
-            let index = position % LAP;
-
-            if index == BLOCK_CAP {
-                let should_wait = || {
-                    let current_pos = self.producer.position.load(Ordering::Relaxed);
-                    current_pos % LAP == BLOCK_CAP
-                };
-
-                self.producer.waiters.wait_while(should_wait);
-                continue;
-            }
-
-            if index + 1 == BLOCK_CAP && next_block.is_none() {
-                next_block = Some(Box::new(Block::new()));
-            }
-
-            let mut block = self.producer.block.load(Ordering::Acquire);
+            let mut block = self.tail.load(Ordering::Acquire);
             if block.is_null() {
                 let new_block = Box::into_raw(Box::new(Block::new()));
+                assert_eq!(new_block.addr() & CAPACITY, 0);
 
-                if let Err(_) = self.producer.block.compare_exchange(
+                if let Err(_) = self.tail.compare_exchange(
                     ptr::null_mut(),
                     new_block,
                     Ordering::Release,
@@ -333,70 +275,82 @@ impl<T> MpscQueue<T> {
                 }
 
                 block = new_block;
-                self.consumer.block.store(new_block, Ordering::Release);
+                self.head.store(block, Ordering::Release);
             }
 
-            let new_position = position.wrapping_add(1);
-            if let Err(_) = self.producer.position.compare_exchange_weak(
-                position,
-                new_position,
+            let index = block.addr() & CAPACITY;
+            if index == CAPACITY {
+                if self.waiters.should_park() || !backoff.try_yield_now() {
+                    self.waiters.park_while(|| {
+                        let current_block = self.tail.load(Ordering::Acquire);
+                        block.addr() == current_block.addr()
+                    });
+                }
+
+                continue;
+            }
+
+            let new_index = index + 1;
+            if new_index == CAPACITY && next_block.is_none() {
+                next_block = Some(Box::new(Block::new()));
+            }
+
+            if let Err(_) = self.tail.compare_exchange(
+                block,
+                block.map_addr(|ptr| (ptr & !CAPACITY) | new_index),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                spin.yield_now();
+                backoff.yield_now();
                 continue;
             }
 
             unsafe {
-                if index + 1 == BLOCK_CAP {
+                let block = block.map_addr(|ptr| ptr & !CAPACITY);
+                assert!(!block.is_null());
+
+                if new_index == CAPACITY {
                     let next_block = Box::into_raw(next_block.unwrap());
-                    self.producer.block.store(next_block, Ordering::Release);
+                    assert_eq!(next_block.addr() & CAPACITY, 0);
+
+                    self.tail.store(next_block, Ordering::Release);
+                    self.waiters.unpark_all();
+
+                    assert!((*block).next.load(Ordering::Relaxed).is_null());
                     (*block).next.store(next_block, Ordering::Release);
-                    
-                    let next_position = new_position.wrapping_add(1);
-                    self.producer.position.store(next_position, Ordering::Release);
-                    self.producer.waiters.wake_all();
                 }
 
-                let value = NonNull::from((*block).values.get_unchecked(index)).as_ptr();
-                let stored = NonNull::from((*block).stored.get_unchecked(index)).as_ptr();
-
-                (*value).write(item);
-                (*stored).store(true, Ordering::Release);
+                (*block).slots.get(index).unwrap().write(value);
                 return;
             }
         }
     }
 
     pub unsafe fn pop(&self) -> Option<T> {
-        let mut block = self.consumer.block.load(Ordering::Acquire);
+        let mut block = self.head.load(Ordering::Acquire);
         if block.is_null() {
             return None;
         }
 
-        let mut index = self.consumer.index.get();
-        if index == BLOCK_CAP {
-            let next = (*block).next.load(Ordering::Acquire);
-            if next.is_null() {
-                return None;
-            }
+        let mut index = block.addr() & CAPACITY;
+        block = block.map_addr(|ptr| ptr & !CAPACITY);
 
-            drop(Box::from_raw(block));
-            block = next;
+        if index == CAPACITY {
+            block = (*block).next.load(Ordering::Acquire);
             index = 0;
-
-            self.consumer.index.set(index);
-            self.consumer.block.store(block, Ordering::Relaxed);
         }
 
-        let value = (*block).values.get_unchecked(index);
-        let stored = (*block).stored.get_unchecked(index);
-
-        if stored.load(Ordering::Acquire) {
-            self.consumer.index.set(index + 1);
-            return Some(value.read()); 
+        if block.is_null() {
+            return None;
         }
 
-        None
+        let value = (*block).slots.get(index).unwrap().read();
+        if value.is_some() {
+            index += 1;
+        }
+
+        let with_index = block.map_addr(|ptr| ptr | index);
+        self.head.store(with_index, Ordering::Relaxed);
+        value
     }
 }
