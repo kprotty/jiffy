@@ -41,7 +41,12 @@ pub struct Backoff {
 
 impl Backoff {
     pub fn try_yield_now(&mut self) -> bool {
-        self.counter < 32 && {
+        let mut max_spin = 0;
+        if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+            max_spin = 32;
+        }
+
+        self.counter < max_spin && {
             self.counter += 1;
             spin_loop();
             true
@@ -49,14 +54,16 @@ impl Backoff {
     }
 
     pub fn yield_now(&mut self) {
-        self.counter = self.counter.wrapping_add(1);
-        if self.counter <= 3 {
-            (0..(1 << self.counter)).for_each(|_| spin_loop());
-        } else if cfg!(windows) {
-            (0..(1 << self.counter.min(5))).for_each(|_| spin_loop());
-        } else {
-            thread::yield_now();
+        if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+            self.counter += 1;
+
+            if self.counter <= 10 {
+                (0..(1 << self.counter.min(5))).for_each(|_| spin_loop());
+                return;
+            }
         }
+
+        thread::yield_now();
     }
 }
 
