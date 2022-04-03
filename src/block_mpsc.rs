@@ -17,11 +17,14 @@ impl Backoff {
     fn yield_now(&mut self) {
         self.counter = self.counter.wrapping_add(1);
 
+        // Quick optimistic spinning.
         if self.counter <= 3 {
             (0..(1 << self.counter)).for_each(|_| spin_loop());
             return;
         }
 
+        // On windows, it's better to backoff with spinning on x86 than is it 
+        // to backoff with yielding (even with Sleep(0) or Slepe(1)) for some reason.
         if cfg!(all(
             windows,
             any(target_arch = "x86", target_arch = "x86_64")
@@ -56,7 +59,7 @@ impl<T> Slot<T> {
     };
 
     unsafe fn write(&self, value: T) {
-        assert_eq!(self.state.load(Ordering::Relaxed), EMPTY);
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), EMPTY);
         self.value.get().write(MaybeUninit::new(value));
         self.state.store(STORED, Ordering::Release);
     }
@@ -69,7 +72,7 @@ impl<T> Slot<T> {
                 Read::Consumed(self.value.get().read().assume_init())
             }
             state => {
-                assert_eq!(state, CONSUMED);
+                debug_assert_eq!(state, CONSUMED);
                 Read::AlreadyConsumed
             }
         }
@@ -109,47 +112,47 @@ impl<T> MpscQueue<T> {
     }
 
     pub fn push(&self, value: T) {
-        unsafe {
-            let mut backoff = Backoff::default();
-            let mut next_block = ptr::null_mut::<Block<T>>();
+        let mut backoff = Backoff::default();
+        let mut next_block = ptr::null_mut::<Block<T>>();
 
-            loop {
-                let producer = self.producer.load(Ordering::Relaxed);
-                let mut block = producer.map_addr(|addr| addr & !BLOCK_MASK);
-                let index = producer.addr() & BLOCK_MASK;
+        loop {
+            let producer = self.producer.load(Ordering::Relaxed);
+            let mut block = producer.map_addr(|addr| addr & !BLOCK_MASK);
+            let index = producer.addr() & BLOCK_MASK;
 
-                let mut new_block = block;
-                let new_index = (index + 1) & BLOCK_MASK;
+            let mut new_block = block;
+            let new_index = (index + 1) & BLOCK_MASK;
 
-                if block.is_null() || new_index == 0 {
-                    if next_block.is_null() {
-                        next_block = Box::into_raw(Box::new(Block::new()));
-                    }
-                    new_block = next_block;
+            if block.is_null() || new_index == 0 {
+                if next_block.is_null() {
+                    next_block = Box::into_raw(Box::new(Block::new()));
                 }
+                new_block = next_block;
+            }
 
-                if let Err(_) = self.producer.compare_exchange(
-                    producer,
-                    new_block.map_addr(|addr| addr | new_index),
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    backoff.yield_now();
-                    continue;
-                }
+            if let Err(_) = self.producer.compare_exchange(
+                producer,
+                new_block.map_addr(|addr| addr | new_index),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                backoff.yield_now();
+                continue;
+            }
 
+            unsafe {
                 if block.is_null() {
                     block = new_block;
                     self.consumer.store(new_block, Ordering::Release);
                 } else if new_index == 0 {
-                    assert!(!ptr::eq(block, new_block));
+                    debug_assert!(!ptr::eq(block, new_block));
                     (*block).next.store(new_block, Ordering::Release);
                 } else if !next_block.is_null() {
-                    assert!(ptr::eq(block, new_block));
+                    debug_assert!(ptr::eq(block, new_block));
                     drop(Box::from_raw(next_block));
                 }
 
-                (*block).slots.get(index).unwrap().write(value);
+                (*block).slots.get_unchecked(index).write(value);
                 return;
             }
         }
@@ -161,9 +164,9 @@ impl<T> MpscQueue<T> {
         let mut index = consumer.addr() & BLOCK_MASK;
 
         while !block.is_null() {
-            match (*block).slots.get(index).unwrap().read() {
+            match (*block).slots.get_unchecked(index).read() {
                 Read::Empty => break,
-                Read::AlreadyConsumed => assert_eq!(index, 0),
+                Read::AlreadyConsumed => {},
                 Read::Consumed(value) => {
                     index = (index + 1) & BLOCK_MASK;
                     block = block.map_addr(|addr| addr | index);
@@ -177,7 +180,9 @@ impl<T> MpscQueue<T> {
                 break;
             }
 
+            debug_assert_eq!(index, 0);
             self.consumer.store(next_block, Ordering::Relaxed);
+
             drop(Box::from_raw(block));
             block = next_block;
         }
@@ -194,7 +199,7 @@ impl<T> Drop for MpscQueue<T> {
             let mut index = consumer.addr() & BLOCK_MASK;
 
             while !block.is_null() {
-                if let Read::Consumed(value) = (*block).slots.get(index).unwrap().read() {
+                if let Read::Consumed(value) = (*block).slots.get_unchecked(index).read() {
                     index = (index + 1) & BLOCK_MASK;
                     drop(value);
                     continue;
