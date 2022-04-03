@@ -54,6 +54,30 @@ fn mpsc(c: &mut Criterion) {
     let mut group = c.benchmark_group("mpsc");
     group.sample_size(10);
 
+    group.bench_function("block-mpsc", |b| {
+        b.iter(|| {
+            let queue = Chan::new(jiffy::block_mpsc::MpscQueue::default());
+            let barrier = Barrier::new(THREADS + 1);
+
+            crossbeam::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|_| {
+                        barrier.wait();
+                        for i in 0..MESSAGES / THREADS {
+                            queue.send::<usize, _>(|c| Ok(c.push(i))).unwrap();
+                        }
+                    });
+                }
+
+                barrier.wait();
+                for _ in 0..MESSAGES {
+                    queue.recv(|c| unsafe { c.pop() }).unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
+
     group.bench_function("protty-mpsc", |b| {
         b.iter(|| {
             let queue = Chan::new(jiffy::protty_mpsc::MpscQueue::default());
