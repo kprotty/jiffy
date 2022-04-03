@@ -55,10 +55,17 @@ impl Backoff {
 
     pub fn yield_now(&mut self) {
         if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
-            self.counter += 1;
+            self.counter = self.counter.wrapping_add(1);
 
-            if self.counter <= 10 {
-                (0..(1 << self.counter.min(5))).for_each(|_| spin_loop());
+            if self.counter <= 3 {
+                (0..(1 << self.counter)).for_each(|_| spin_loop());
+                return;
+            }
+
+            // On windows, it's better to backoff with spinning over yielding
+            // (even with Sleep(0) or Sleep(1)) for some reason.
+            if cfg!(windows) {
+                (0..(1 << self.counter.min(10))).for_each(|_| spin_loop());
                 return;
             }
         }

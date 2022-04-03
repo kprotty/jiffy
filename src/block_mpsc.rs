@@ -1,41 +1,13 @@
-use crate::{shared::StrictProvenance, utils::CachePadded};
+use crate::{
+    shared::{Backoff, StrictProvenance},
+    utils::CachePadded,
+};
 use std::{
     cell::UnsafeCell,
-    hint::spin_loop,
     mem::{drop, MaybeUninit},
     ptr,
     sync::atomic::{AtomicPtr, AtomicU8, Ordering},
-    thread,
 };
-
-#[derive(Default)]
-struct Backoff {
-    counter: usize,
-}
-
-impl Backoff {
-    fn yield_now(&mut self) {
-        self.counter = self.counter.wrapping_add(1);
-
-        // Quick optimistic spinning.
-        if self.counter <= 3 {
-            (0..(1 << self.counter)).for_each(|_| spin_loop());
-            return;
-        }
-
-        // On windows, it's better to backoff with spinning on x86 than is it 
-        // to backoff with yielding (even with Sleep(0) or Slepe(1)) for some reason.
-        if cfg!(all(
-            windows,
-            any(target_arch = "x86", target_arch = "x86_64")
-        )) {
-            (0..(1 << self.counter.min(10))).for_each(|_| spin_loop());
-            return;
-        }
-
-        thread::yield_now();
-    }
-}
 
 enum Read<T> {
     Empty,
@@ -166,7 +138,7 @@ impl<T> MpscQueue<T> {
         while !block.is_null() {
             match (*block).slots.get_unchecked(index).read() {
                 Read::Empty => break,
-                Read::AlreadyConsumed => {},
+                Read::AlreadyConsumed => {}
                 Read::Consumed(value) => {
                     index = (index + 1) & BLOCK_MASK;
                     block = block.map_addr(|addr| addr | index);
