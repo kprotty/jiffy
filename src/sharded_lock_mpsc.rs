@@ -45,6 +45,21 @@ impl<T> Lock<T> {
     }
 
     #[inline]
+    fn try_with<F>(&self, f: impl FnOnce(&mut T) -> F) -> Option<F> {
+        if self.lock_fast() {
+            let result = f(unsafe { &mut *self.value.get() });
+
+            if !self.unlock_fast() {
+                self.unlock_slow();
+            }
+
+            return Some(result);
+        }
+
+        None
+    }
+
+    #[inline]
     fn with<F>(&self, f: impl FnOnce(&mut T) -> F) -> F {
         if !self.lock_fast() {
             self.lock_slow();
@@ -172,14 +187,18 @@ impl<T> Producer<T> {
     }
 
     fn push(&self, item: T) {
-        self.deque.with(|deque| deque.push_back(item));
-        self.pending.store(true, Ordering::Release);
+        self.deque.with(|deque| {
+            deque.push_back(item);
+            self.pending.store(true, Ordering::Release);
+        });
     }
 
-    fn swap(&self, new: &mut VecDeque<T>) {
+    fn try_swap(&self, new: &mut VecDeque<T>) {
         if self.pending.load(Ordering::Acquire) {
-            self.pending.store(false, Ordering::Relaxed);
-            self.deque.with(|deque| swap(new, deque));
+            let _ = self.deque.try_with(|deque| {
+                swap(new, deque);
+                self.pending.store(false, Ordering::Relaxed);
+            });
         }
     }
 }
@@ -221,7 +240,7 @@ impl<T> MpscQueue<T> {
         }
 
         for producer in self.producers.iter() {
-            producer.swap(consumer);
+            producer.try_swap(consumer);
             if consumer.len() > 0 {
                 break;
             }
