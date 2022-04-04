@@ -1,14 +1,12 @@
 use crate::utils::CachePadded;
 use std::{
     cell::{Cell, UnsafeCell},
-    hint::spin_loop,
     mem::{drop, MaybeUninit},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    thread,
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
 };
 
 pub struct Queue<T> {
-    semaphore: CachePadded<AtomicUsize>,
+    semaphore: CachePadded<AtomicIsize>,
     tail: CachePadded<AtomicUsize>,
     head: CachePadded<Cell<usize>>,
     stored: Box<[AtomicBool]>,
@@ -21,7 +19,7 @@ unsafe impl<T: Send> Sync for Queue<T> {}
 impl<T> Queue<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
-            semaphore: CachePadded(AtomicUsize::new(capacity)),
+            semaphore: CachePadded(AtomicIsize::new(capacity.try_into().unwrap())),
             tail: CachePadded(AtomicUsize::new(0)),
             head: CachePadded(Cell::new(0)),
             stored: (0..capacity).map(|_| AtomicBool::new(false)).collect(),
@@ -32,41 +30,12 @@ impl<T> Queue<T> {
     }
 
     pub fn push(&self, value: T) -> Result<(), T> {
-        let mut counter = 0usize;
-        loop {
-            let sema = self.semaphore.load(Ordering::Relaxed);
-            let new_sema = match sema.checked_sub(1) {
-                Some(new) => new,
-                None => return Err(value),
-            };
-
-            if self
-                .semaphore
-                .compare_exchange(sema, new_sema, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-
-            if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
-                counter = counter.wrapping_add(1);
-
-                if counter <= 3 {
-                    (0..(1 << counter)).for_each(|_| spin_loop());
-                    continue;
-                }
-
-                if cfg!(windows) {
-                    (0..(1 << counter.min(10))).for_each(|_| spin_loop());
-                    continue;
-                }
-            }
-
-            thread::yield_now();
+        if !self.sem_try_wait() {
+            return Err(value);
         }
 
         Ok(unsafe {
-            let tail = self.tail.fetch_add(1, Ordering::AcqRel);
+            let tail = self.tail.fetch_add(1, Ordering::Relaxed);
             let index = tail % self.stored.len();
 
             self.values
@@ -94,8 +63,75 @@ impl<T> Queue<T> {
         self.head.set((index + 1) % self.stored.len());
         stored.store(false, Ordering::Relaxed);
 
-        self.semaphore.fetch_add(1, Ordering::Release);
+        self.sem_post();
         Some(value)
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl<T> Queue<T> {
+    fn sem_try_wait(&self) -> bool {
+        loop {
+            let sema = self.semaphore.fetch_sub(1, Ordering::Acquire);
+            if sema > 0 {
+                return true;
+            }
+
+            (0..32).for_each(|_| std::hint::spin_loop());
+
+            let sema = self.semaphore.fetch_add(1, Ordering::Relaxed);
+            if sema < 0 {
+                return false;
+            }
+
+            std::thread::yield_now();
+        }
+    }
+
+    fn sem_post(&self) {
+        self.semaphore.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+impl<T> Queue<T> {
+    #[inline]
+    fn fetch_update(
+        &self,
+        ordering: Ordering,
+        mut f: impl FnMut(isize) -> Option<isize>,
+    ) -> Result<isize, isize> {
+        loop {
+            let sema = self.semaphore.load(Ordering::Relaxed);
+            let new_sema = match f(sema) {
+                Some(new) => new,
+                None => return Err(sema),
+            };
+
+            match self
+                .semaphore
+                .compare_exchange(sema, new_sema, ordering, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(sema),
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn sem_try_wait(&self) -> bool {
+        self.fetch_update(Ordering::Acquire, |sema| {
+            if sema == 0 {
+                None
+            } else {
+                Some(sema - 1)
+            }
+        })
+        .is_ok()
+    }
+
+    fn sem_post(&self) {
+        self.fetch_update(Ordering::Release, |sema| sema + 1)
+            .unwrap();
     }
 }
 

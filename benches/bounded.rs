@@ -42,12 +42,16 @@ impl<T> Chan<T> {
     }
 
     fn unpark(&self) {
-        let _ = self
-            .unparked
+        self.unparked
             .fetch_update(Ordering::Release, Ordering::Relaxed, |unparked| {
-                (!unparked).then(|| true)
+                if unparked {
+                    None
+                } else {
+                    Some(true)
+                }
             })
-            .map(|_| self.thread.unpark());
+            .map(|_| self.thread.unpark())
+            .unwrap_or(());
     }
 }
 
@@ -102,68 +106,68 @@ fn mpsc(c: &mut Criterion) {
         })
     });
 
-    // group.bench_function("crossbeam", |b| {
-    //     b.iter(|| {
-    //         let (tx, rx) = crossbeam::channel::bounded(messages);
+    group.bench_function("crossbeam", |b| {
+        b.iter(|| {
+            let (tx, rx) = crossbeam::channel::bounded(messages);
 
-    //         crossbeam::scope(|scope| {
-    //             for _ in 0..threads {
-    //                 scope.spawn(|_| {
-    //                     for i in 0..messages / threads {
-    //                         tx.try_send(i).unwrap();
-    //                     }
-    //                 });
-    //             }
+            crossbeam::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        for i in 0..messages / threads {
+                            tx.try_send(i).unwrap();
+                        }
+                    });
+                }
 
-    //             for _ in 0..messages {
-    //                 rx.recv().unwrap();
-    //             }
-    //         })
-    //         .unwrap();
-    //     })
-    // });
+                for _ in 0..messages {
+                    rx.recv().unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
 
-    // group.bench_function("std", |b| {
-    //     b.iter(|| {
-    //         let (tx, rx) = std::sync::mpsc::sync_channel(messages);
+    group.bench_function("std", |b| {
+        b.iter(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(messages);
 
-    //         crossbeam::scope(|scope| {
-    //             for _ in 0..threads {
-    //                 scope.spawn(|_| {
-    //                     for i in 0..messages / threads {
-    //                         tx.try_send(i).unwrap();
-    //                     }
-    //                 });
-    //             }
+            crossbeam::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        for i in 0..messages / threads {
+                            tx.try_send(i).unwrap();
+                        }
+                    });
+                }
 
-    //             for _ in 0..messages {
-    //                 rx.recv().unwrap();
-    //             }
-    //         })
-    //         .unwrap();
-    //     })
-    // });
+                for _ in 0..messages {
+                    rx.recv().unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
 
-    // group.bench_function("flume", |b| {
-    //     b.iter(|| {
-    //         let (tx, rx) = flume::bounded(messages);
+    group.bench_function("flume", |b| {
+        b.iter(|| {
+            let (tx, rx) = flume::bounded(messages);
 
-    //         crossbeam::scope(|scope| {
-    //             for _ in 0..threads {
-    //                 scope.spawn(|_| {
-    //                     for i in 0..messages / threads {
-    //                         tx.try_send(i).unwrap();
-    //                     }
-    //                 });
-    //             }
+            crossbeam::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        for i in 0..messages / threads {
+                            tx.try_send(i).unwrap();
+                        }
+                    });
+                }
 
-    //             for _ in 0..messages {
-    //                 rx.recv().unwrap();
-    //             }
-    //         })
-    //         .unwrap();
-    //     })
-    // });
+                for _ in 0..messages {
+                    rx.recv().unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
 
     group.finish();
 }
