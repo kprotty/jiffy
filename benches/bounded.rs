@@ -26,33 +26,41 @@ impl<T> Chan<T> {
     }
 
     fn recv<V>(&self, f: impl Fn(&T) -> Option<V>) -> Option<V> {
+        let mut counter = 0;
         loop {
             match f(&self.inner) {
                 Some(x) => break Some(x),
                 None => {
-                    while !self.try_unpark() {
-                        thread::park();
+                    if counter <= 3 {
+                        counter += 1;
+                        (0..(1<<counter)).for_each(|_| std::hint::spin_loop());
+                    } else {
+                        std::thread::yield_now();
                     }
+                    
+                    // while !self.try_unpark() {
+                    //     thread::park();
+                    // }
                 }
             }
         }
     }
 
-    fn try_unpark(&self) -> bool {
-        self.unparked.swap(false, Ordering::Acquire)
-    }
+    // fn try_unpark(&self) -> bool {
+    //     self.unparked.swap(false, Ordering::Acquire)
+    // }
 
     fn unpark(&self) {
-        self.unparked
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |unparked| {
-                if unparked {
-                    None
-                } else {
-                    Some(true)
-                }
-            })
-            .map(|_| self.thread.unpark())
-            .unwrap_or(());
+        // self.unparked
+        //     .fetch_update(Ordering::Release, Ordering::Relaxed, |unparked| {
+        //         if unparked {
+        //             None
+        //         } else {
+        //             Some(true)
+        //         }
+        //     })
+        //     .map(|_| self.thread.unpark())
+        //     .unwrap_or(());
     }
 }
 

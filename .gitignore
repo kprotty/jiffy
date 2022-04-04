@@ -1,2 +1,3 @@
-/target
+target/
+usync_mpsc/target/
 Cargo.lock

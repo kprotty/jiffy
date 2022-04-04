@@ -1,0 +1,6 @@
+[package]
+name = "usync_mpsc"
+version = "0.0.0"
+authors = ["kprotty"]
+license = "MIT"
+edition = "2021"
