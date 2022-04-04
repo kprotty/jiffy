@@ -42,9 +42,12 @@ impl<T> Chan<T> {
     }
 
     fn unpark(&self) {
-        if !self.unparked.swap(true, Ordering::Release) {
-            self.thread.unpark();
-        }
+        let _ = self
+            .unparked
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |unparked| {
+                (!unparked).then(|| true)
+            })
+            .map(|_| self.thread.unpark());
     }
 }
 
