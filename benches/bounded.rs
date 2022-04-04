@@ -30,13 +30,7 @@ impl<T> Chan<T> {
                 Some(x) => break Some(x),
                 None => {
                     while !self.try_unpark() {
-                        let start = std::time::Instant::now();
-                        let deadlocked = std::time::Duration::from_millis(500);
-
-                        thread::park_timeout(deadlocked);
-                        if start.elapsed() >= deadlocked {
-                            return None;
-                        }
+                        thread::park();
                     }
                 }
             }
@@ -48,7 +42,7 @@ impl<T> Chan<T> {
     }
 
     fn unpark(&self) {
-        if !self.unparked.swap(false, Ordering::Release) {
+        if !self.unparked.swap(true, Ordering::Release) {
             self.thread.unpark();
         }
     }
