@@ -30,7 +30,13 @@ impl<T> Chan<T> {
                 Some(x) => break Some(x),
                 None => {
                     while !self.try_unpark() {
-                        thread::park();
+                        let start = std::time::Instant::now();
+                        let deadlocked = std::time::Duration::from_millis(500);
+
+                        thread::park_timeout(deadlocked);
+                        if start.elapsed() >= deadlocked {
+                            return None;
+                        }
                     }
                 }
             }
@@ -67,8 +73,11 @@ fn mpsc(c: &mut Criterion) {
                     });
                 }
 
-                for _ in 0..messages {
-                    queue.recv(|c| unsafe { c.pop() }).unwrap();
+                for i in 0..messages {
+                    match queue.recv(|c| unsafe { c.pop() }) {
+                        Some(_) => {}
+                        None => panic!("deadlocked at {}/{}", i, messages),
+                    }
                 }
             })
             .unwrap();
