@@ -130,7 +130,7 @@ impl<T> Queue<T> {
     }
 
     fn sem_post(&self) {
-        self.fetch_update(Ordering::Release, |sema| sema + 1)
+        self.fetch_update(Ordering::Release, |sema| Some(sema + 1))
             .unwrap();
     }
 }
