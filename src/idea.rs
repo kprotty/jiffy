@@ -8,7 +8,7 @@ use std::{
     hint::spin_loop,
     cell::{UnsafeCell, Cell},
     mem::{drop, MaybeUninit},
-    sync::atomic::{AtomicPtr, AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{fence, AtomicPtr, AtomicBool, AtomicUsize, Ordering},
 };
 
 #[derive(Default)]
@@ -16,18 +16,20 @@ struct Backoff(usize);
 
 impl Backoff {
     fn is_completed(&self) -> bool {
-        self.0 > 3
+        self.0 > 6
     }
 
     fn yield_now(&mut self) {
-        self.0 = self.0.wrapping_add(1);
-        if !self.is_completed() || cfg!(windows) {
-            for _ in 0..(1 << self.0.min(10)) {
-                spin_loop();
-            }
-        } else {
-            thread::yield_now();
+        if self.0 < 10 {
+            self.0 += 1;
         }
+
+        if !self.is_completed() || cfg!(windows) {
+            (0..(1 << self.0)).for_each(|_| spin_loop());
+            return;
+        }
+
+        thread::yield_now();
     }
 }
 
@@ -275,8 +277,10 @@ impl WaitQueue {
     fn park_if(&self, condition: impl FnOnce() -> bool) {
         pinned::<Waiter, _, _>(|waiter| {
             if self.queue.with(|queue| {
+                fence(Ordering::SeqCst);
+                
                 if !self.pending.load(Ordering::Relaxed) {
-                    self.pending.store(true, Ordering::SeqCst);
+                    self.pending.store(true, Ordering::Relaxed);
                 }
 
                 if !condition() {
@@ -296,16 +300,14 @@ impl WaitQueue {
     }
 
     fn unpark_one(&self) {
-        if !self.pending.load(Ordering::SeqCst) {
+        fence(Ordering::SeqCst);
+
+        if !self.pending.load(Ordering::Relaxed) {
             return;
         }
 
         unsafe {
             if let Some(waiter) = self.queue.with(|queue| {
-                if !self.pending.load(Ordering::Relaxed) {
-                    return None;
-                }
-
                 let waiter = (*queue)?;
                 *queue = waiter.as_ref().next.get();
 
@@ -414,7 +416,7 @@ impl<T> Queue<T> {
 
             self.producer.wait_queue.park_if(|| {
                 let mask = self.slots.len() - 1;
-                let pos = self.producer.position.load(Ordering::SeqCst);
+                let pos = self.producer.position.load(Ordering::Acquire);
                 let slot = unsafe { self.slots.get_unchecked(pos & mask) };
 
                 if slot.stored.load(Ordering::Acquire) {
@@ -434,7 +436,7 @@ impl<T> Queue<T> {
 
         if slot.stored.load(Ordering::Acquire) {
             let value = slot.value.get().read().assume_init();
-            slot.stored.store(false, Ordering::SeqCst);
+            slot.stored.store(false, Ordering::Release);
 
             self.producer.wait_queue.unpark_one();
 
@@ -446,6 +448,14 @@ impl<T> Queue<T> {
     }
 
     pub unsafe fn recv(&self) -> T {
+        let mut spin = Backoff::default();
+        while !spin.is_completed() {
+            match self.try_recv() {
+                Some(value) => return value,
+                None => spin.yield_now(),
+            }
+        }
+
         loop {
             match self.try_recv() {
                 Some(value) => return value,
