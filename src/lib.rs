@@ -3,3 +3,4 @@
 pub mod bounded;
 pub mod unbounded;
 mod utils;
+pub mod idea;

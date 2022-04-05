@@ -61,6 +61,27 @@ fn mpsc(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("mpsc");
 
+    group.bench_function("idea", |b| {
+        b.iter(|| {
+            let queue = jiffy::idea::Queue::new(messages);
+
+            crossbeam::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        for i in 0..messages / threads {
+                            queue.try_send(i).unwrap();
+                        }
+                    });
+                }
+
+                for _ in 0..messages {
+                    let _ = unsafe { queue.recv() };
+                }
+            })
+            .unwrap();
+        })
+    });
+
     group.bench_function("jiffy", |b| {
         b.iter(|| {
             let queue = Chan::new(jiffy::bounded::Queue::new(messages));
