@@ -51,7 +51,7 @@ mod atomic {
 mod atomic {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    pub struct Guard(AtomicIsize);
+    pub struct Guard(AtomicUsize);
 
     impl Guard {
         pub fn new(permits: usize) -> Self {
@@ -63,7 +63,7 @@ mod atomic {
         }
 
         pub fn release(&self) {
-            fetch_update(&self.0, Ordering::Release, |v| Some(v + 1)).unwrap()
+            let _ = fetch_update(&self.0, Ordering::Release, |v| Some(v + 1)).unwrap();
         }
     }
 
