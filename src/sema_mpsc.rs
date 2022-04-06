@@ -55,7 +55,7 @@ mod atomic {
 
     impl Guard {
         pub fn new(permits: usize) -> Self {
-            Self(AtomicUsize::new(0))
+            Self(AtomicUsize::new(permits))
         }
 
         pub fn try_acquire(&self) -> bool {
