@@ -20,10 +20,13 @@ impl<T> Value<T> {
     }
 }
 
-const BLOCK_MASK: usize = 1024 - 1;
-const BLOCK_SIZE: usize = 32;
+const BLOCK_ALIGN: usize = 4096;
+const BLOCK_MASK: usize = BLOCK_ALIGN - 1;
+const BLOCK_SIZE: usize = 1024;
 
-#[repr(align(1024))]
+// max amount of sender threads == BLOCK_ALIGN
+
+#[repr(align(4096))]
 struct Block<T> {
     values: [Value<T>; BLOCK_SIZE],
     stored: [AtomicBool; BLOCK_SIZE],

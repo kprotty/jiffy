@@ -61,6 +61,30 @@ fn mpsc(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("mpsc");
 
+    group.bench_function("loo_ish", |b| {
+        b.iter(|| {
+            let x = std::sync::Barrier::new(threads + 1);
+            let queue = Chan::new(jiffy::loo_ish::Queue::new());
+
+            crossbeam::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|_| {
+                        x.wait();
+                        for i in 0..messages / threads {
+                            queue.send(|c| Result::<(), usize>::Ok(c.send(i))).unwrap();
+                        }
+                    });
+                }
+
+                x.wait();
+                for _ in 0..messages {
+                    queue.recv(|c| unsafe { c.try_recv() }).unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
+
     group.bench_function("sema_mpsc", |b| {
         b.iter(|| {
             let x = std::sync::Barrier::new(threads + 1);
