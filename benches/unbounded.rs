@@ -1,5 +1,5 @@
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, fence, Ordering},
     thread,
 };
 
@@ -19,37 +19,28 @@ impl Chan {
     }
 
     fn send<V, T>(&self, x: &T, f: impl Fn(&T) -> Result<(), V>) -> Result<(), V> {
-        f(&x).map(|_| self.unpark())
+        f(&x).map(|_| {
+            fence(Ordering::SeqCst);
+
+            self.unparked
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |p| (!p).then(|| true))
+                .map(|_| self.thread.unpark())
+                .unwrap_or(())
+        })
     }
 
-    fn recv<V, T>(&self, x: &T, f: impl Fn(&T) -> Option<V>) -> Option<V> {
+    fn recv<V, T>(&self, x: &T, mut f: impl FnMut(&T) -> Option<V>) -> Option<V> {
         loop {
-            match f(x) {
-                Some(x) => break Some(x),
-                None => {
-                    while !self.try_unpark() {
-                        thread::park();
-                    }
-                }
+            if let Some(v) = f(x) {
+                return Some(v);
+            }
+
+            fence(Ordering::SeqCst);
+
+            while !self.unparked.swap(false, Ordering::Acquire) {
+                thread::park();
             }
         }
-    }
-
-    fn try_unpark(&self) -> bool {
-        self.unparked.swap(false, Ordering::Acquire)
-    }
-
-    fn unpark(&self) {
-        self.unparked
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |unparked| {
-                if unparked {
-                    None
-                } else {
-                    Some(true)
-                }
-            })
-            .map(|_| self.thread.unpark())
-            .unwrap_or(());
     }
 }
 
@@ -108,9 +99,9 @@ fn mpsc_bounded(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("riffy (unsound)", |b| {
+    group.bench_function("block-mpsc", |b| {
         b.iter(|| {
-            let t = riffy::MpscQueue::new();
+            let t = jiffy::block::Queue::EMPTY;
             let c = Chan::new();
 
             crossbeam::scope(|scope| {
@@ -118,14 +109,16 @@ fn mpsc_bounded(c: &mut Criterion) {
                     scope.spawn({
                         |_| {
                             for i in 0..MESSAGES / THREADS {
-                                c.send(&t, |c| c.enqueue(i)).unwrap();
+                                c.send(&t, |c| Ok::<_, ()>(c.send(i))).unwrap();
                             }
                         }
                     });
                 }
 
                 for _ in 0..MESSAGES {
-                    c.recv(&t, |c| c.dequeue()).unwrap();
+                    unsafe {
+                        c.recv(&t, |c| c.try_recv()).unwrap();
+                    }
                 }
             })
             .unwrap();
@@ -134,7 +127,7 @@ fn mpsc_bounded(c: &mut Criterion) {
 
     group.bench_function("protty-looish", |b| {
         b.iter(|| {
-            let t = jiffy::protty_looish::Queue::EMPTY;
+            let t = jiffy::protty::Queue::EMPTY;
             let c = Chan::new();
 
             crossbeam::scope(|scope| {
