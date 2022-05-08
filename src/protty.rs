@@ -63,8 +63,7 @@ impl<T> Queue<T> {
 
     pub fn send(&self, value: T) {
         let mut allocated_block = ptr::null_mut::<Block<T>>();
-
-        let (block, index, prev_block) = 'reserved: loop {
+        loop {
             let mut block_and_index = self
                 .producer
                 .block_and_index
@@ -72,52 +71,58 @@ impl<T> Queue<T> {
 
             let mut block = block_and_index.map_addr(|addr| addr & !(BLOCK_ALIGN - 1));
             let mut index = block_and_index.addr() & (BLOCK_ALIGN - 1);
+
             if !block.is_null() && index < BLOCK_SIZE {
-                break 'reserved (block, index, None);
+                return unsafe {
+                    (*block).values.get_unchecked(index).0.get().write(MaybeUninit::new(value));
+                    (*block).stored.get_unchecked(index).store(true, Ordering::Release);
+
+                    if !allocated_block.is_null() {
+                        drop(Box::from_raw(allocated_block));
+                    }
+                };
             }
 
             if allocated_block.is_null() {
                 allocated_block = Box::into_raw(Box::new(Block::EMPTY));
-                std::sync::atomic::compiler_fence(Ordering::AcqRel);
+
+                unsafe {
+                    block = allocated_block;
+                    (*block).values.get_unchecked(0).0.get().write(MaybeUninit::new(ptr::read(&value)));
+                    (*block).stored.get_unchecked(0).store(true, Ordering::Release);
+                }
             }
 
-            block_and_index = self.producer.block_and_index.load(Ordering::Relaxed);
             loop {
                 block = block_and_index.map_addr(|addr| addr & !(BLOCK_ALIGN - 1));
-                index = block_and_index.addr() & (BLOCK_ALIGN - 1);
+                if block == allocated_block {
+                    break; // producer changed, consumer read all; dealloced, then our alloc gave it back
+                }
 
-                assert_ne!(block, allocated_block);
+                index = block_and_index.addr() & (BLOCK_ALIGN - 1);
                 if !block.is_null() && index < BLOCK_SIZE {
                     break;
                 }
 
-                match self.producer.block_and_index.compare_exchange_weak(
+                if let Err(e) = self.producer.block_and_index.compare_exchange_weak(
                     block_and_index,
                     allocated_block.map_addr(|addr| addr | 1),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => break 'reserved (allocated_block, 0, Some(block)),
-                    Err(e) => block_and_index = e,
+                    block_and_index = e;
+                    continue;
                 }
-            }
-        };
 
-        unsafe {
-            (*block).values.get_unchecked(index).0.get().write(MaybeUninit::new(value));
-            (*block).stored.get_unchecked(index).store(true, Ordering::Release);
+                return unsafe {
+                    let prev_link = match NonNull::new(block) {
+                        Some(prev) => NonNull::from(&prev.as_ref().next),
+                        None => NonNull::from(&self.consumer.block),
+                    };
 
-            if let Some(prev) = prev_block {
-                let prev_link = match NonNull::new(prev) {
-                    Some(prev) => NonNull::from(&prev.as_ref().next),
-                    None => NonNull::from(&self.consumer.block),
+                    let next_block = allocated_block;
+                    prev_link.as_ref().store(next_block, Ordering::Release);
                 };
-
-                prev_link.as_ref().store(block, Ordering::Release);
-            }
-
-            if !allocated_block.is_null() && (allocated_block != block) {
-                drop(Box::from_raw(allocated_block));
             }
         }
     }
