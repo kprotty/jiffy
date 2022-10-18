@@ -1,4 +1,5 @@
 #![allow(unused, dead_code)]
+#![feature(strict_provenance)]
 
 pub mod bounded;
 pub mod unbounded;
@@ -205,3 +206,5 @@ pub mod protty_looish {
         }
     }
 }
+
+pub mod block_mpsc;
