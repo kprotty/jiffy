@@ -2,7 +2,6 @@ use crate::utils::{CachePadded};
 use std::{
     cell::UnsafeCell,
     mem::{drop, MaybeUninit},
-    hint::spin_loop,
     ptr::{null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicBool, Ordering},
 };
@@ -68,8 +67,18 @@ impl<T> Queue<T> {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                backoff = (backoff + 1).min(10);
-                (0..(1 << backoff)).for_each(|_| spin_loop());
+                #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+                {
+                    _ = backoff;
+                    unsafe { std::arch::asm!("wfe", options(nomem, nostack)) };
+                }
+                
+                #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64")))]
+                {
+                    backoff = (backoff + 1).min(10);
+                    (0..(1 << backoff)).for_each(|_| std::hint::spin_loop());
+                }
+                
                 continue;
             }
 
