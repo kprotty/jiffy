@@ -17,6 +17,7 @@ flume = "0.10.12"
 num_cpus = "1.13.1"
 # loo = { path = "../looqueue-rs" }
 riffy = { git = "https://github.com/s1ck/riffy" }
+kanal = { git = "https://github.com/fereidani/kanal" }
 
 [dev-dependencies]
 criterion = "0.3.5"

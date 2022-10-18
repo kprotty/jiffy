@@ -50,21 +50,43 @@ fn mpsc_bounded(c: &mut Criterion) {
     let mut group = c.benchmark_group("mpsc");
     group.sample_size(20);
 
-    const THREADS: usize = 12 * 2;
-    const MESSAGES: usize = THREADS * 200_000;
+    const THREADS: usize = 4;
+    const MESSAGES: usize = THREADS * 5_000_000;
+
+    group.bench_function("kanal", |b| {
+        b.iter(|| {
+            let (tx, rx) = kanal::unbounded();
+
+            crossbeam::scope(|scope| {
+                for _ in 0..THREADS {
+                    let tx = tx.clone();
+                    scope.spawn({
+                        move |_| {
+                            for i in 0..MESSAGES / THREADS + 1 {
+                                tx.send(i).unwrap();
+                            }
+                        }
+                    });
+                }
+
+                for _ in 0..MESSAGES {
+                    rx.recv().unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
 
     group.bench_function("block_mpsc", |b| {
         b.iter(|| {
             let t = jiffy::block_mpsc::Queue::EMPTY;
             let c = Chan::new();
-            let b = std::sync::Barrier::new(THREADS);
 
             crossbeam::scope(|scope| {
                 for _ in 0..THREADS {
                     scope.spawn({
                         |_| {
-                            b.wait();
-                            for i in 0..MESSAGES / THREADS {
+                            for i in 0..MESSAGES / THREADS + 1 {
                                 c.send(&t, |c| Ok::<_, ()>(c.send(i))).unwrap();
                             }
                         }
@@ -81,44 +103,16 @@ fn mpsc_bounded(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("jiffy", |b| {
-        b.iter(|| {
-            let q = jiffy::unbounded::Queue::new();
-            let c = Chan::new();
-            let b = std::sync::Barrier::new(THREADS);
-
-            crossbeam::scope(|scope| {
-                for _ in 0..THREADS {
-                    scope.spawn({
-                        |_| {
-                            b.wait();
-                            for i in 0..MESSAGES / THREADS {
-                                c.send(&q, |c| Ok::<_, ()>(c.push(i))).unwrap();
-                            }
-                        }
-                    });
-                }
-
-                for _ in 0..MESSAGES {
-                    c.recv(&q, |c| c.pop()).unwrap();
-                }
-            })
-            .unwrap();
-        })
-    });
-
     group.bench_function("crossbeam", |b| {
         b.iter(|| {
             let t = crossbeam::queue::SegQueue::new();
             let c = Chan::new();
-            let b = std::sync::Barrier::new(THREADS);
 
             crossbeam::scope(|scope| {
                 for _ in 0..THREADS {
                     scope.spawn({
                         |_| {
-                            b.wait();
-                            for i in 0..MESSAGES / THREADS {
+                            for i in 0..MESSAGES / THREADS + 1 {
                                 c.send(&t, |c| Ok::<_, ()>(c.push(i))).unwrap();
                             }
                         }
@@ -132,6 +126,32 @@ fn mpsc_bounded(c: &mut Criterion) {
             .unwrap();
         })
     });
+
+    // group.bench_function("jiffy", |b| {
+    //     b.iter(|| {
+    //         let q = jiffy::unbounded::Queue::new();
+    //         let c = Chan::new();
+    //         let b = std::sync::Barrier::new(THREADS);
+
+    //         crossbeam::scope(|scope| {
+    //             for _ in 0..THREADS {
+    //                 scope.spawn({
+    //                     |_| {
+    //                         b.wait();
+    //                         for i in 0..MESSAGES / THREADS {
+    //                             c.send(&q, |c| Ok::<_, ()>(c.push(i))).unwrap();
+    //                         }
+    //                     }
+    //                 });
+    //             }
+
+    //             for _ in 0..MESSAGES {
+    //                 c.recv(&q, |c| c.pop()).unwrap();
+    //             }
+    //         })
+    //         .unwrap();
+    //     })
+    // });
 
     // group.bench_function("riffy (unsound)", |b| {
     //     b.iter(|| {
@@ -157,7 +177,6 @@ fn mpsc_bounded(c: &mut Criterion) {
     //     })
     // });
 
-    
 
     group.finish();
 }

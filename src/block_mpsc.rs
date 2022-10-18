@@ -6,11 +6,11 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicBool, Ordering},
 };
 
-const BLOCK_SIZE: usize = 32;
+const BLOCK_SIZE: usize = 64;
 const BLOCK_ALIGN: usize = BLOCK_SIZE << 1;
 const BLOCK_MASK: usize = !(BLOCK_ALIGN - 1);
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct Block<T> {
     next: AtomicPtr<Self>,
     stored: [AtomicBool; BLOCK_SIZE],
