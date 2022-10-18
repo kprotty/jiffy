@@ -149,29 +149,53 @@ fn mpsc_bounded(c: &mut Criterion) {
         })
     });
 
-    // group.bench_function("crossbeam", |b| {
-    //     b.iter(|| {
-    //         let t = crossbeam::queue::SegQueue::new();
-    //         let c = Chan::new();
+    group.bench_function("flume", |b| {
+        b.iter(|| {
+            let (tx, rx) = flume::unbounded();
 
-    //         crossbeam::scope(|scope| {
-    //             for _ in 0..THREADS {
-    //                 scope.spawn({
-    //                     |_| {
-    //                         record_latency(|i| {
-    //                             c.send(&t, |c| Ok::<_, ()>(c.push(i))).unwrap();
-    //                         });
-    //                     }
-    //                 });
-    //             }
+            crossbeam::scope(|scope| {
+                for _ in 0..THREADS {
+                    let tx = tx.clone();
+                    scope.spawn({
+                        move |_| {
+                            record_latency(|i| {
+                                tx.send(i).unwrap();
+                            });
+                        }
+                    });
+                }
 
-    //             for _ in 0..MESSAGES {
-    //                 c.recv(&t, |c| c.pop()).unwrap();
-    //             }
-    //         })
-    //         .unwrap();
-    //     })
-    // });
+                for _ in 0..MESSAGES {
+                    rx.recv().unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
+
+    group.bench_function("crossbeam", |b| {
+        b.iter(|| {
+            let t = crossbeam::queue::SegQueue::new();
+            let c = Chan::new();
+
+            crossbeam::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn({
+                        |_| {
+                            record_latency(|i| {
+                                c.send(&t, |c| Ok::<_, ()>(c.push(i))).unwrap();
+                            });
+                        }
+                    });
+                }
+
+                for _ in 0..MESSAGES {
+                    c.recv(&t, |c| c.pop()).unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
 
     // group.bench_function("jiffy", |b| {
     //     b.iter(|| {

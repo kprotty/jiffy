@@ -16,7 +16,7 @@ os_lock = ["libc"]
 
 [dependencies]
 crossbeam = "0.8.1"
-flume = "0.10.12"
+flume = "0.10.14"
 num_cpus = "1.13.1"
 # loo = { path = "../looqueue-rs" }
 lock_api = "0.4.9"
