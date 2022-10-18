@@ -216,11 +216,11 @@ mod internal {
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
         mod futex {
-            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+            pub fn wait(ptr: &super::AtomicU32, cmp: u32) {
                 let _ = unsafe {
                     libc::syscall(
                         libc::SYS_futex,
-                        ptr as *const _ as *mut _,
+                        ptr as *const _ as *const i32,
                         libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
                         cmp,
                         std::ptr::null::<libc::timespec>(),
@@ -228,11 +228,11 @@ mod internal {
                 };
             }
 
-            fn wake(ptr: &super::AtomicU32, n: u32) {
+            pub fn wake(ptr: &super::AtomicU32, n: u32) {
                 let _ = unsafe {
                     libc::syscall(
                         libc::SYS_futex,
-                        ptr as *const _ as *mut _,
+                        ptr as *const _ as *const i32,
                         libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
                         n,
                     )
@@ -242,7 +242,7 @@ mod internal {
 
         #[cfg(target_os = "freebsd")]
         mod futex {
-            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+            pub fn wait(ptr: &super::AtomicU32, cmp: u32) {
                 let _ = unsafe {
                     libc::_umtx_op(
                         ptr as *const _ as *mut _,
@@ -254,7 +254,7 @@ mod internal {
                 };
             }
 
-            fn wake(ptr: &super::AtomicU32, n: u32) {
+            pub fn wake(ptr: &super::AtomicU32, n: u32) {
                 let _ = unsafe {
                     libc::_umtx_op(
                         ptr as *const _ as *mut _,
@@ -269,7 +269,7 @@ mod internal {
 
         #[cfg(target_os = "openbsd")]
         mod futex {
-            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+            pub fn wait(ptr: &super::AtomicU32, cmp: u32) {
                 let _ = unsafe {
                     libc::futex(
                         ptr as *const _ as *mut u32,
@@ -281,7 +281,7 @@ mod internal {
                 };
             }
 
-            fn wake(ptr: &super::AtomicU32, n: u32) {
+            pub fn wake(ptr: &super::AtomicU32, n: u32) {
                 let _ = unsafe {
                     libc::futex(
                         ptr as *const _ as *mut u32,
@@ -296,7 +296,7 @@ mod internal {
 
         #[cfg(target_os = "dragonfly")]
         mod futex {
-            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+            pub fn wait(ptr: &super::AtomicU32, cmp: u32) {
                 let _ = unsafe {
                     libc::umtx_sleep(
                         ptr as *const _ as *const i32,
@@ -306,7 +306,7 @@ mod internal {
                 };
             }
 
-            fn wake(ptr: &super::AtomicU32, n: u32) {
+            pub fn wake(ptr: &super::AtomicU32, n: u32) {
                 let _ = unsafe {
                     libc::umtx_wakeup(
                         ptr as *const _ as *const i32,
@@ -327,7 +327,7 @@ mod internal {
                 ) -> libc::c_int;
             }
 
-            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+            pub fn wait(ptr: &super::AtomicU32, cmp: u32) {
                 let _ = unsafe {
                     emscripten_futex_wait(
                         ptr,
@@ -337,7 +337,7 @@ mod internal {
                 };
             }
 
-            fn wake(ptr: &super::AtomicU32, n: u32) {
+            pub fn wake(ptr: &super::AtomicU32, n: u32) {
                 let _ = unsafe {
                     emscripten_futex_wait(
                         ptr,
@@ -367,7 +367,7 @@ mod internal {
                 fn zx_futex_wake(value_ptr: *const zx_futex_t, wake_count: u32) -> zx_status_t;
             }
 
-            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+            pub fn wait(ptr: &super::AtomicU32, cmp: u32) {
                 let _ = unsafe {
                     zx_futex_wait(
                         ptr,
@@ -378,7 +378,7 @@ mod internal {
                 };
             }
 
-            fn wake(ptr: &super::AtomicU32, n: u32) {
+            pub fn wake(ptr: &super::AtomicU32, n: u32) {
                 let _ = unsafe {
                     zx_futex_wake(
                         ptr,
