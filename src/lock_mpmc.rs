@@ -137,7 +137,7 @@ mod internal {
 
         unsafe impl lock_api::RawMutex for RawMutex {
             const INIT: Self = Self {
-                oul: UnsafeCell::new(null_mut()),
+                oul: UnsafeCell::new(0),
             };
     
             type GuardMarker = super::Guard;
