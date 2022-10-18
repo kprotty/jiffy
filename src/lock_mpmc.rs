@@ -24,11 +24,11 @@ mod internal {
                     fn thread_switch(
                         port: *mut std::os::raw::c_void,
                         option: std::os::raw::c_int,
-                        time: u32,
+                        time: std::os::raw::c_int,
                     ) -> std::os::raw::c_int;
                 }
                 const SWITCH_OPTION_DEPRESS: std::os::raw::c_int = 1;
-                thread_switch(std::ptr::null_mut(), SWITCH_OPTION_DEPRESS, spins);
+                unsafe { thread_switch(std::ptr::null_mut(), SWITCH_OPTION_DEPRESS, spins) };
             }
 
             if b.load(ordering) == value {
@@ -58,8 +58,12 @@ mod internal {
 
     #[cfg(target_os = "linux")]
     fn wait_until(b: &AtomicBool, value: bool, ordering: Ordering) {
-        loop {
-            std::thread::yield_now();
+        for i in 0.. {
+            match () {
+                _ if i <= 3 => (0..(1 << i)).for_each(|_| std::hint::spin_loop()),
+                _ => std::thread::yield_now(),
+            }
+
             if b.load(ordering) == value {
                 return;
             }
@@ -76,36 +80,357 @@ mod internal {
         }
     }
 
-    pub struct RawMutex {
-        locked: AtomicBool,
-    }
+    type Guard = lock_api::GuardSend;
 
-    unsafe impl lock_api::RawMutex for RawMutex {
-        const INIT: Self = Self {
-            locked: AtomicBool::new(false),
-        };
+    #[cfg(all(feature = "os_lock", target_os = "windows"))]
+    mod lock {
+        use std::{cell::UnsafeCell, ptr::null_mut, os::raw::c_void};
 
-        type GuardMarker = lock_api::GuardSend;
-
-        #[inline(always)]
-        fn try_lock(&self) -> bool {
-            self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        extern "system" {
+            fn AcquireSRWLockExclusive(p: *mut *mut c_void);
+            fn ReleaseSRWLockExclusive(p: *mut *mut c_void);
         }
 
-        fn lock(&self) {
-            if !self.try_lock() {
-                loop {
-                    wait_until(&self.locked, false, Ordering::Relaxed);
-                    if self.try_lock() {
-                        break;
+        pub struct RawMutex {
+            srwlock: UnsafeCell<*mut c_void>,
+        }
+
+        unsafe impl Send for RawMutex {}
+        unsafe impl Sync for RawMutex {}
+
+        unsafe impl lock_api::RawMutex for RawMutex {
+            const INIT: Self = Self {
+                srwlock: UnsafeCell::new(null_mut()),
+            };
+    
+            type GuardMarker = super::Guard;
+            
+            fn try_lock(&self) -> bool {
+                unreachable!()
+            }
+    
+            fn lock(&self) {
+                unsafe { AcquireSRWLockExclusive(self.srwlock.get()) }
+            }
+    
+            unsafe fn unlock(&self) {
+                ReleaseSRWLockExclusive(self.srwlock.get())
+            }
+        }
+    }
+
+    #[cfg(all(feature = "os_lock", target_vendor = "apple"))]
+    mod lock {
+        use std::{cell::UnsafeCell, ptr::null_mut};
+
+        extern "C" {
+            fn os_unfair_lock_lock(p: *mut u32);
+            fn os_unfair_lock_unlock(p: *mut u32);
+        }
+
+        pub struct RawMutex {
+            oul: UnsafeCell<u32>,
+        }
+
+        unsafe impl Send for RawMutex {}
+        unsafe impl Sync for RawMutex {}
+
+        unsafe impl lock_api::RawMutex for RawMutex {
+            const INIT: Self = Self {
+                oul: UnsafeCell::new(null_mut()),
+            };
+    
+            type GuardMarker = super::Guard;
+            
+            fn try_lock(&self) -> bool {
+                unreachable!()
+            }
+    
+            fn lock(&self) {
+                unsafe { os_unfair_lock_lock(self.oul.get()) }
+            }
+    
+            unsafe fn unlock(&self) {
+                os_unfair_lock_unlock(self.oul.get())
+            }
+        }
+    }
+
+    #[cfg(all(feature = "os_lock", any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "fuchsia",
+    )))]
+    mod lock {
+        use std::{sync::atomic::{AtomicU32, Ordering}};
+
+        const UNLOCKED: u32 = 0;
+        const LOCKED: u32 = 1;
+        const CONTENDED: u32 = 2;
+
+        pub struct RawMutex {
+            state: AtomicU32,
+        }
+
+        unsafe impl lock_api::RawMutex for RawMutex {
+            const INIT: Self = Self {
+                state: AtomicU32::new(UNLOCKED),
+            };
+    
+            type GuardMarker = super::Guard;
+            
+            fn try_lock(&self) -> bool {
+                unreachable!()
+            }
+    
+            fn lock(&self) {
+                if let Err(state) = self.state.compare_exchange_weak(
+                    UNLOCKED,
+                    LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    if state == CONTENDED {
+                        futex::wait(&self.state, CONTENDED);
                     }
+
+                    while self.state.swap(CONTENDED, Ordering::Acquire) != UNLOCKED {
+                        futex::wait(&self.state, CONTENDED);
+                    }
+                }
+            }
+    
+            unsafe fn unlock(&self) {
+                if self.state.swap(UNLOCKED, Ordering::Release) == CONTENDED {
+                    futex::wake(&self.state, 1);
                 }
             }
         }
 
-        #[inline(always)]
-        unsafe fn unlock(&self) {
-            self.locked.store(false, Ordering::Release);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        mod futex {
+            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+                let _ = unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        ptr as *const _ as *mut _,
+                        libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                        cmp,
+                        std::ptr::null::<libc::timespec>(),
+                    )
+                };
+            }
+
+            fn wake(ptr: &super::AtomicU32, n: u32) {
+                let _ = unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        ptr as *const _ as *mut _,
+                        libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+                        n,
+                    )
+                };
+            }
+        }
+
+        #[cfg(target_os = "freebsd")]
+        mod futex {
+            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+                let _ = unsafe {
+                    libc::_umtx_op(
+                        ptr as *const _ as *mut _,
+                        libc::UMTX_OP_WAIT_UINT_PRIVATE,
+                        cmp as libc::c_ulong,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+
+            fn wake(ptr: &super::AtomicU32, n: u32) {
+                let _ = unsafe {
+                    libc::_umtx_op(
+                        ptr as *const _ as *mut _,
+                        libc::UMTX_OP_WAKE_PRIVATE,
+                        n as libc::c_ulong,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+        }
+
+        #[cfg(target_os = "openbsd")]
+        mod futex {
+            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+                let _ = unsafe {
+                    libc::futex(
+                        ptr as *const _ as *mut u32,
+                        libc::FUTEX_WAIT,
+                        cmp as i32,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+
+            fn wake(ptr: &super::AtomicU32, n: u32) {
+                let _ = unsafe {
+                    libc::futex(
+                        ptr as *const _ as *mut u32,
+                        libc::FUTEX_WAKE,
+                        n as i32,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+        }
+
+        #[cfg(target_os = "dragonfly")]
+        mod futex {
+            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+                let _ = unsafe {
+                    libc::umtx_sleep(
+                        ptr as *const _ as *const i32,
+                        cmp as i32,
+                        0i32,
+                    )
+                };
+            }
+
+            fn wake(ptr: &super::AtomicU32, n: u32) {
+                let _ = unsafe {
+                    libc::umtx_wakeup(
+                        ptr as *const _ as *const i32,
+                        n as i32,
+                    )
+                };
+            }
+        }
+
+        #[cfg(target_os = "emscripten")]
+        mod futex {
+            extern "C" {
+                fn emscripten_futex_wake(addr: *const super::AtomicU32, count: libc::c_int) -> libc::c_int;
+                fn emscripten_futex_wait(
+                    addr: *const super::AtomicU32,
+                    val: libc::c_uint,
+                    max_wait_ms: libc::c_double,
+                ) -> libc::c_int;
+            }
+
+            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+                let _ = unsafe {
+                    emscripten_futex_wait(
+                        ptr,
+                        cmp as libc::c_uint,
+                        f64::INFINITY,
+                    ) != -libc::ETIMEDOUT
+                };
+            }
+
+            fn wake(ptr: &super::AtomicU32, n: u32) {
+                let _ = unsafe {
+                    emscripten_futex_wait(
+                        ptr,
+                        n as libc::c_int,
+                    )
+                };
+            }
+        }
+
+        #[cfg(target_os = "fuchsia")]
+        mod futex {
+            type zx_futex_t = super::AtomicU32;
+            type zx_handle_t = u32;
+            type zx_status_t = i32;
+            type zx_time_t = i64;
+
+            const ZX_HANDLE_INVALID: zx_handle_t = 0;
+            const ZX_TIME_INFINITE: zx_time_t = zx_time_t::MAX;
+
+            extern "C" {
+                fn zx_futex_wait(
+                    value_ptr: *const zx_futex_t,
+                    current_value: zx_futex_t,
+                    new_futex_owner: zx_handle_t,
+                    deadline: zx_time_t,
+                ) -> zx_status_t;
+                fn zx_futex_wake(value_ptr: *const zx_futex_t, wake_count: u32) -> zx_status_t;
+            }
+
+            fn wait(ptr: &super::AtomicU32, cmp: u32) {
+                let _ = unsafe {
+                    zx_futex_wait(
+                        ptr,
+                        super::AtomicU32::new(cmp),
+                        ZX_HANDLE_INVALID,
+                        ZX_TIME_INFINITE,
+                    )
+                };
+            }
+
+            fn wake(ptr: &super::AtomicU32, n: u32) {
+                let _ = unsafe {
+                    zx_futex_wake(
+                        ptr,
+                        n,
+                    )
+                };
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "os_lock"), not(any(
+        target_os = "windows",
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "fuchsia",
+    ))))]
+    mod lock {
+        use super::{AtomicBool, Ordering, wait_until};
+
+        pub struct RawMutex {
+            locked: AtomicBool,
+        }
+
+        unsafe impl lock_api::RawMutex for RawMutex {
+            const INIT: Self = Self {
+                locked: AtomicBool::new(false),
+            };
+    
+            type GuardMarker = super::Guard;
+            
+            #[inline(always)]
+            fn try_lock(&self) -> bool {
+                self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+            }
+    
+            fn lock(&self) {
+                if !self.try_lock() {
+                    loop {
+                        wait_until(&self.locked, false, Ordering::Relaxed);
+                        if self.try_lock() {
+                            break;
+                        }
+                    }
+                }
+            }
+    
+            #[inline(always)]
+            unsafe fn unlock(&self) {
+                self.locked.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -131,7 +456,7 @@ mod internal {
 
     unsafe impl<T: Send> Send for Inner<T> {}
     
-    pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
+    pub type Mutex<T> = lock_api::Mutex<lock::RawMutex, T>;
     pub type Channel<T> = Arc<Mutex<CachePadded<Inner<T>>>>;
 
     pub fn channel<T>(capacity: Option<usize>) -> Channel<T> {

@@ -11,12 +11,16 @@ harness = false
 name = "unbounded"
 harness = false
 
+[features]
+os_lock = ["libc"]
+
 [dependencies]
 crossbeam = "0.8.1"
 flume = "0.10.12"
 num_cpus = "1.13.1"
 # loo = { path = "../looqueue-rs" }
 lock_api = "0.4.9"
+libc = { version = "0.2", optional = true }
 riffy = { git = "https://github.com/s1ck/riffy" }
 kanal = { git = "https://github.com/fereidani/kanal" }
 
