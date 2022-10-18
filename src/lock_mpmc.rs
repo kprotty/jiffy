@@ -9,15 +9,22 @@ mod internal {
         sync::atomic::{AtomicBool, Ordering},
     };
 
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    fn wait_until(b: &AtomicBool, value: bool, ordering: Ordering) {
+        loop {
+            unsafe { std::arch::asm!("wfe", options(nomem, nostack)); }
+            if b.load(ordering) == value {
+                return;
+            }
+        }
+    }
+
+    #[cfg(all(target_vendor = "apple", not(target_arch = "aarch64")))]
     fn wait_until(b: &AtomicBool, value: bool, ordering: Ordering) {
         // https://github.com/apple/swift-corelibs-libdispatch/blob/main/src/shims/yield.h#L62-L80
-        let mut spins: std::os::raw::c_int = if cfg!(target_arch = "aarch64") { -10 } else  { -1024 };
+        let mut spins: std::os::raw::c_int = -1024;
         loop {
             if spins < 0 {
-                #[cfg(target_arch = "aarch64")]
-                unsafe { std::arch::asm!("wfe", options(nomem, nostack)); }
-                #[cfg(not(target_arch = "aarch64"))]
                 std::hint::spin_loop();
             } else {
                 extern "C" {
@@ -59,11 +66,7 @@ mod internal {
     #[cfg(target_os = "linux")]
     fn wait_until(b: &AtomicBool, value: bool, ordering: Ordering) {
         for i in 0.. {
-            match () {
-                _ if i <= 3 => (0..(1 << i)).for_each(|_| std::hint::spin_loop()),
-                _ => std::thread::yield_now(),
-            }
-
+            std::thread::sleep(std::time::Duration::from_nanos(1u64 << i.min(20)));
             if b.load(ordering) == value {
                 return;
             }
