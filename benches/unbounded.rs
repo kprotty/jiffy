@@ -75,24 +75,50 @@ fn mpsc_bounded(c: &mut Criterion) {
         }
     }
 
-    group.bench_function("lock_mpmc", |b| {
+    // group.bench_function("lock_mpmc", |b| {
+    //     b.iter(|| {
+    //         let (tx, rx) = jiffy::lock_mpmc::channel();
+
+    //         crossbeam::scope(|scope| {
+    //             for _ in 0..THREADS {
+    //                 let tx = tx.clone();
+    //                 scope.spawn({
+    //                     move |_| {
+    //                         record_latency(|i| {
+    //                             tx.send(i).unwrap();
+    //                         });
+    //                     }
+    //                 });
+    //             }
+
+    //             for _ in 0..MESSAGES {
+    //                 rx.recv().unwrap();
+    //             }
+    //         })
+    //         .unwrap();
+    //     })
+    // });
+
+    group.bench_function("ploo_mpsc", |b| {
         b.iter(|| {
-            let (tx, rx) = jiffy::lock_mpmc::channel();
+            let t = jiffy::ploo_mpsc::Queue::EMPTY;
+            let c = Chan::new();
 
             crossbeam::scope(|scope| {
                 for _ in 0..THREADS {
-                    let tx = tx.clone();
                     scope.spawn({
-                        move |_| {
+                        |_| {
                             record_latency(|i| {
-                                tx.send(i).unwrap();
+                                c.send(&t, |c| Ok::<_, ()>(c.send(i))).unwrap();
                             });
                         }
                     });
                 }
 
                 for _ in 0..MESSAGES {
-                    rx.recv().unwrap();
+                    unsafe {
+                        c.recv(&t, |c| c.try_recv()).unwrap();
+                    }
                 }
             })
             .unwrap();
@@ -149,79 +175,79 @@ fn mpsc_bounded(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("flume", |b| {
-        b.iter(|| {
-            let (tx, rx) = flume::unbounded();
-
-            crossbeam::scope(|scope| {
-                for _ in 0..THREADS {
-                    let tx = tx.clone();
-                    scope.spawn({
-                        move |_| {
-                            record_latency(|i| {
-                                tx.send(i).unwrap();
-                            });
-                        }
-                    });
-                }
-
-                for _ in 0..MESSAGES {
-                    rx.recv().unwrap();
-                }
-            })
-            .unwrap();
-        })
-    });
-
-    group.bench_function("crossbeam", |b| {
-        b.iter(|| {
-            let t = crossbeam::queue::SegQueue::new();
-            let c = Chan::new();
-
-            crossbeam::scope(|scope| {
-                for _ in 0..THREADS {
-                    scope.spawn({
-                        |_| {
-                            record_latency(|i| {
-                                c.send(&t, |c| Ok::<_, ()>(c.push(i))).unwrap();
-                            });
-                        }
-                    });
-                }
-
-                for _ in 0..MESSAGES {
-                    c.recv(&t, |c| c.pop()).unwrap();
-                }
-            })
-            .unwrap();
-        })
-    });
-
-    // group.bench_function("jiffy", |b| {
+    // group.bench_function("flume", |b| {
     //     b.iter(|| {
-    //         let q = jiffy::unbounded::Queue::new();
-    //         let c = Chan::new();
-    //         let b = std::sync::Barrier::new(THREADS);
+    //         let (tx, rx) = flume::unbounded();
 
     //         crossbeam::scope(|scope| {
     //             for _ in 0..THREADS {
+    //                 let tx = tx.clone();
     //                 scope.spawn({
-    //                     |_| {
-    //                         b.wait();
-    //                         for i in 0..MESSAGES / THREADS {
-    //                             c.send(&q, |c| Ok::<_, ()>(c.push(i))).unwrap();
-    //                         }
+    //                     move |_| {
+    //                         record_latency(|i| {
+    //                             tx.send(i).unwrap();
+    //                         });
     //                     }
     //                 });
     //             }
 
     //             for _ in 0..MESSAGES {
-    //                 c.recv(&q, |c| c.pop()).unwrap();
+    //                 rx.recv().unwrap();
     //             }
     //         })
     //         .unwrap();
     //     })
     // });
+
+    // group.bench_function("crossbeam", |b| {
+    //     b.iter(|| {
+    //         let t = crossbeam::queue::SegQueue::new();
+    //         let c = Chan::new();
+
+    //         crossbeam::scope(|scope| {
+    //             for _ in 0..THREADS {
+    //                 scope.spawn({
+    //                     |_| {
+    //                         record_latency(|i| {
+    //                             c.send(&t, |c| Ok::<_, ()>(c.push(i))).unwrap();
+    //                         });
+    //                     }
+    //                 });
+    //             }
+
+    //             for _ in 0..MESSAGES {
+    //                 c.recv(&t, |c| c.pop()).unwrap();
+    //             }
+    //         })
+    //         .unwrap();
+    //     })
+    // });
+
+    group.bench_function("jiffy", |b| {
+        b.iter(|| {
+            let q = jiffy::unbounded::Queue::new();
+            let c = Chan::new();
+            let b = std::sync::Barrier::new(THREADS);
+
+            crossbeam::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn({
+                        |_| {
+                            b.wait();
+                            for i in 0..MESSAGES / THREADS {
+                                c.send(&q, |c| Ok::<_, ()>(c.push(i))).unwrap();
+                            }
+                        }
+                    });
+                }
+
+                for _ in 0..MESSAGES {
+                    c.recv(&q, |c| c.pop()).unwrap();
+                }
+            })
+            .unwrap();
+        })
+    });
 
     // group.bench_function("riffy (unsound)", |b| {
     //     b.iter(|| {
